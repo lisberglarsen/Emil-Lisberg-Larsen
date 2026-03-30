@@ -9,7 +9,7 @@ on:
   workflow_dispatch:          # Tillader manuel kørsel fra GitHub
 
 jobs:
-  kør-mailagent:
+  run-mailagent:
     runs-on: ubuntu-latest
 
     steps:
