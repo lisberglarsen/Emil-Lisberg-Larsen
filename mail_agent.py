@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Outlook Mailagent v3
+Outlook Mailagent v4
 – Prioritering & kategorisering
+– Selvlæring (tracker svarmønstre og justerer prioritet automatisk)
 – Afsender-læring
 – Opgaveliste
 – Opfølgningspåminder
@@ -23,7 +24,7 @@ AZURE_TENANT_ID   = os.getenv("AZURE_TENANT_ID", "common")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 HOURS_BACK        = int(os.getenv("HOURS_BACK", "4"))
 SEND_EMAIL_REPORT = os.getenv("SEND_EMAIL_REPORT", "true").lower() == "true"
-OPFØLGNING_TIMER  = int(os.getenv("OPFØLGNING_TIMER", "24"))   # timer før påminder
+OPFØLGNING_TIMER  = int(os.getenv("OPFØLGNING_TIMER", "24"))
 
 BASE             = Path(__file__).parent
 REPORTS_DIR      = BASE / "rapporter"
@@ -32,6 +33,7 @@ OPGAVER_JSON     = BASE / "opgaver.json"
 OPGAVER_MD       = BASE / "OPGAVER.md"
 AFSENDERE_FILE   = BASE / "vigtige_afsendere.json"
 AFVENTER_FILE    = BASE / "afventer_svar.json"
+LAERING_FILE     = BASE / "laering.json"
 
 SCOPES = [
     "https://graph.microsoft.com/Mail.Read",
@@ -48,6 +50,99 @@ def load_vigtige_afsendere() -> list:
     if AFSENDERE_FILE.exists():
         return [a.lower().strip() for a in json.loads(AFSENDERE_FILE.read_text()).get("afsendere", [])]
     return []
+
+
+# ── Selvlæring ────────────────────────────────────────────────────────────────
+def load_laering() -> dict:
+    """Indlæs læringsdata – scorer pr. afsender baseret på svarmønstre."""
+    if LAERING_FILE.exists():
+        return json.loads(LAERING_FILE.read_text(encoding="utf-8"))
+    return {"afsendere": {}, "sidst_opdateret": None}
+
+def gem_laering(data: dict):
+    LAERING_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def opdater_laering(indkomne: list, sendte: list):
+    """
+    Sammenlign indkomne mails med sendte svar.
+    Øg score for afsendere du svarer hurtigt på – sænk for dem du aldrig svarer på.
+    """
+    data = load_laering()
+    scorer = data.get("afsendere", {})
+    nu = datetime.now(timezone.utc)
+
+    # Lav et lookup: conversationId → sendt tidspunkt
+    sendte_conv = {}
+    for s in sendte:
+        conv = s.get("conversationId")
+        sent_tid = s.get("sentDateTime", "")
+        if conv and sent_tid:
+            sendte_conv[conv] = sent_tid
+
+    for mail in indkomne:
+        afsender = mail.get("from", {}).get("emailAddress", {}).get("address", "").lower()
+        if not afsender:
+            continue
+
+        conv = mail.get("conversationId")
+        modtaget_str = mail.get("receivedDateTime", "")
+
+        if afsender not in scorer:
+            scorer[afsender] = {
+                "navn": mail.get("from", {}).get("emailAddress", {}).get("name", afsender),
+                "score": 50,        # Starter neutralt på 50
+                "hurtigt_svar": 0,  # Antal gange svaret inden 2 timer
+                "aldrig_svar": 0,   # Antal gange ikke svaret
+                "total": 0,
+            }
+
+        scorer[afsender]["total"] += 1
+
+        if conv and conv in sendte_conv:
+            # Beregn svartid
+            try:
+                modtaget = datetime.fromisoformat(modtaget_str.replace("Z", "+00:00"))
+                sendt    = datetime.fromisoformat(sendte_conv[conv].replace("Z", "+00:00"))
+                svartid  = (sendt - modtaget).total_seconds() / 3600  # timer
+
+                if svartid <= 2:
+                    # Svarede inden for 2 timer – meget vigtig
+                    scorer[afsender]["score"] = min(100, scorer[afsender]["score"] + 5)
+                    scorer[afsender]["hurtigt_svar"] += 1
+                elif svartid <= 24:
+                    # Svarede inden for en dag – moderat vigtig
+                    scorer[afsender]["score"] = min(100, scorer[afsender]["score"] + 2)
+            except Exception:
+                pass
+        else:
+            # Ingen svar fundet – sænk score en smule
+            scorer[afsender]["score"] = max(0, scorer[afsender]["score"] - 1)
+            scorer[afsender]["aldrig_svar"] += 1
+
+    data["afsendere"] = scorer
+    data["sidst_opdateret"] = nu.isoformat()
+    gem_laering(data)
+    return scorer
+
+def get_laerte_vigtige(scorer: dict, grænse: int = 75) -> list:
+    """Returner afsendere med score over grænsen – automatisk lært."""
+    return [
+        email for email, info in scorer.items()
+        if info.get("score", 0) >= grænse
+    ]
+
+def generer_laering_oversigt(scorer: dict) -> str:
+    """Lav en kort tekst til rapporten om hvad agenten har lært."""
+    if not scorer:
+        return ""
+    top = sorted(scorer.items(), key=lambda x: x[1].get("score", 0), reverse=True)[:5]
+    linjer = []
+    for email, info in top:
+        score = info.get("score", 0)
+        navn  = info.get("navn", email)
+        emoji = "🔴" if score >= 75 else "🟡" if score >= 50 else "🟢"
+        linjer.append(f"{emoji} {navn} (score: {score})")
+    return " · ".join(linjer)
 
 def load_opgaver() -> list:
     return json.loads(OPGAVER_JSON.read_text(encoding="utf-8")) if OPGAVER_JSON.exists() else []
@@ -606,8 +701,16 @@ def main():
         if not emails and not teams_msgs:
             print("✅  Ingen nye mails eller Teams-beskeder\n"); return
 
-        # Vigtige afsendere
-        vigtige = load_vigtige_afsendere()
+        # Vigtige afsendere (manuelt tilføjede)
+        vigtige_manuel = load_vigtige_afsendere()
+
+        # Selvlæring – opdater scorer baseret på sendte svar
+        print("🧠  Opdaterer selvlæring...")
+        scorer = opdater_laering(emails, sent)
+        vigtige_lært = get_laerte_vigtige(scorer)
+        vigtige = list(set(vigtige_manuel + vigtige_lært))
+        laering_oversigt = generer_laering_oversigt(scorer)
+        print(f"    ✓ {len(vigtige_lært)} afsendere lært som vigtige\n")
 
         # AI-analyse
         print("🤖  Analyserer med Claude AI...")
@@ -659,6 +762,7 @@ def main():
         print(f"  📅 Møder: {len(møder)}")
         print(f"  💬 Teams-beskeder: {len(teams_msgs)}")
         print(f"  📋 Nye opgaver: {len(nye_opgaver)} (åbne i alt: {åbne})")
+        print(f"  🧠 Selvlæring: {laering_oversigt or 'Ikke nok data endnu'}")
         print(f"  📄 Rapport: {report_path}")
         print("─"*60 + "\n")
 
