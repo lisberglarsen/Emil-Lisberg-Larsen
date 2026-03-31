@@ -41,33 +41,4 @@ jobs:
       - name: Kør mailagenten
         run: python mail_agent.py
 
-      - name: Gem opdateret login-token
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            if (fs.existsSync('.token_cache.json')) {
-              const token = fs.readFileSync('.token_cache.json', 'utf8');
-              await github.rest.actions.createOrUpdateRepoSecret({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                secret_name: 'MSAL_TOKEN_CACHE',
-                encrypted_value: await (async () => {
-                  const sodium = require('libsodium-wrappers');
-                  await sodium.ready;
-                  const key = (await github.rest.actions.getRepoPublicKey({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                  })).data;
-                  const keyBytes = Buffer.from(key.key, 'base64');
-                  const msgBytes = Buffer.from(token);
-                  const encrypted = sodium.crypto_box_seal(msgBytes, keyBytes);
-                  return Buffer.from(encrypted).toString('base64');
-                })(),
-                key_id: (await github.rest.actions.getRepoPublicKey({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                })).data.key_id,
-              });
-            }
+      # Token-cachen holder i 90 dage – opdater MSAL_TOKEN_CACHE secret manuelt hvis den udløber
