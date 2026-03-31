@@ -224,7 +224,7 @@ def fetch_user_info(token: str) -> dict:
 def fetch_emails(token: str, hours_back: int = 4) -> list:
     since = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = (
-        "https://graph.microsoft.com/v1.0/me/messages"
+        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
         f"?$filter=receivedDateTime ge {since}"
         "&$select=id,subject,from,receivedDateTime,bodyPreview,importance,isRead,hasAttachments,conversationId"
         "&$orderby=receivedDateTime desc&$top=100"
